@@ -1,0 +1,242 @@
+#!/bin/bash
+# ==============================================================================
+# Script ĐÁNH GIÁ SONG SONG 5 SEEDS cho AWSnet tối ưu cho NVIDIA A100 trên Google Colab
+# Mô hình: AWSnet (8.73M tham số)
+# Repository: https://github.com/mintduckk24/AWSnet.git
+# 5 Seeds: [1234, 1098, 1024, 2026, 6868]
+# Tập dữ liệu: MyoPS380 — 76 ca test 3D (myops380_voxel_v3)
+# Tính năng: Chạy song song 5 tiến trình suy luận, tự động gom kết quả và tính Mean ± Std
+# ==============================================================================
+
+set -e
+
+echo "=== [1/3] Thiết lập Môi trường và Đường dẫn ==="
+REPO_URL="https://github.com/mintduckk24/AWSnet.git"
+AWSNET_DIR="/content/AWSnet"
+
+if [ -f "./test.py" ] && [ -d "./models" ]; then
+    AWSNET_DIR="$(pwd)"
+    echo "✅ Đang đứng trực tiếp trong thư mục: $AWSNET_DIR"
+elif [ -d "/content/AWSnet" ]; then
+    echo "✅ Thư mục /content/AWSnet đã tồn tại."
+elif [ -f "/content/AWSnet.zip" ]; then
+    echo "✅ Phát hiện file AWSnet.zip tại /content/. Đang giải nén..."
+    unzip -q -o "/content/AWSnet.zip" -d /content/
+elif [ -f "/content/drive/MyDrive/AWSnet.zip" ]; then
+    echo "✅ Phát hiện file AWSnet.zip trên Google Drive. Đang giải nén..."
+    unzip -q -o "/content/drive/MyDrive/AWSnet.zip" -d /content/
+elif [ -d "/content/drive/MyDrive/AWSnet" ]; then
+    echo "✅ Phát hiện thư mục AWSnet trên Google Drive. Đang sao chép vào /content/AWSnet..."
+    cp -r "/content/drive/MyDrive/AWSnet" /content/AWSnet
+else
+    echo "Đang clone repository từ $REPO_URL..."
+    git clone "$REPO_URL" /content/AWSnet || {
+        echo "❌ Chưa thể clone từ $REPO_URL."
+        exit 1
+    }
+fi
+
+cd "$AWSNET_DIR"
+
+RUN_ROOT="/content/drive/MyDrive/AWSnet_Runs"
+
+# Tự động tìm dataset Processed_data
+DRIVE_DATASET_DIR="/content/drive/MyDrive/MyoPS380_dataset"
+if [ -d "$DRIVE_DATASET_DIR/Processed_data/bSSFP" ]; then
+    LOCAL_DATASET="$DRIVE_DATASET_DIR/Processed_data"
+elif [ -d "/content/drive/MyDrive/Processed_data/bSSFP" ]; then
+    LOCAL_DATASET="/content/drive/MyDrive/Processed_data"
+else
+    FOUND_TRAIN_NPZ=$(find /content -type d -name "train_npz" 2>/dev/null | grep -i "bSSFP" | head -n 1)
+    if [ -n "$FOUND_TRAIN_NPZ" ]; then
+        LOCAL_DATASET=$(dirname $(dirname "$FOUND_TRAIN_NPZ"))
+    elif [ -d "/content/AWSnet/MyoPS380_dataset/Processed_data" ]; then
+        LOCAL_DATASET="/content/AWSnet/MyoPS380_dataset/Processed_data"
+    else
+        LOCAL_DATASET="/content/Dataset/MyoPS380/Processed_data"
+    fi
+fi
+
+SPLIT_DIR="$AWSNET_DIR/dataset/splits/myops380_no_val"
+EVAL_LOGS="/tmp/eval_logs_awsnet"
+mkdir -p "$EVAL_LOGS"
+
+MODEL_NAME="awsnet"
+SEEDS=(1234 1098 1024 2026 6868)
+
+echo "Mô hình đánh giá: $MODEL_NAME"
+echo "5 Seeds: ${SEEDS[*]}"
+echo "Thư mục tìm checkpoints: $RUN_ROOT"
+echo "Thư mục dataset: $LOCAL_DATASET"
+echo "Thư mục split manifest: $SPLIT_DIR"
+
+echo ""
+echo "=== [2/3] Khởi chạy Đánh giá Song Song 5 Seeds trên GPU A100 ==="
+
+PIDS=()
+for SEED in "${SEEDS[@]}"; do
+    # Tự động định vị file checkpoint chính xác cho từng seed
+    CKPT=$(find "$RUN_ROOT" "$AWSNET_DIR/checkpoints" /content/drive/MyDrive -type f -name "*awsnet_seed${SEED}.pt" 2>/dev/null | head -n 1)
+
+    if [ -n "$CKPT" ]; then
+        LOG_FILE="$EVAL_LOGS/eval_${MODEL_NAME}_seed_${SEED}.log"
+        OUTPUT_EVAL_DIR="$RUN_ROOT/eval_awsnet_seed_${SEED}"
+        mkdir -p "$OUTPUT_EVAL_DIR"
+        echo "🚀 [Seed $SEED] Bắt đầu suy luận song song: $(basename "$CKPT")"
+        
+        # Chạy suy luận ngầm (&) trên GPU A100 qua entrypoint test.py
+        python3 "$AWSNET_DIR/test.py" \
+            --checkpoint "$CKPT" \
+            --data-root "$LOCAL_DATASET" \
+            --list-dir "$SPLIT_DIR" \
+            --output-dir "$OUTPUT_EVAL_DIR" \
+            --split test_vol \
+            --batch-size 8 \
+            --amp auto > "$LOG_FILE" 2>&1 &
+        
+        PIDS+=($!)
+    else
+        echo "⚠️ [Seed $SEED] Không tìm thấy checkpoint *awsnet_seed${SEED}.pt trong $RUN_ROOT! Hãy chắc chắn seed này đã train xong."
+    fi
+done
+
+if [ ${#PIDS[@]} -eq 0 ]; then
+    echo "❌ Không tìm thấy bất kỳ checkpoint nào để đánh giá! Hãy kiểm tra lại thư mục $RUN_ROOT."
+    exit 1
+fi
+
+echo ""
+echo "⏳ Đang chạy song song ${#PIDS[@]} tiến trình đánh giá trên GPU A100..."
+echo "👉 Thời gian dự kiến: khoảng 1 - 2 phút (GPU A100 suy luận 76 ca test cực nhanh)."
+
+# Chờ toàn bộ các tiến trình đánh giá hoàn thành
+for pid in "${PIDS[@]}"; do
+    wait $pid || echo "⚠️ Một tiến trình đánh giá (PID $pid) gặp lỗi, tiếp tục tổng hợp các tiến trình khác..."
+done
+
+echo ""
+echo "✅ TOÀN BỘ CÁC TIẾN TRÌNH ĐÁNH GIÁ ĐÃ HOÀN TẤT!"
+
+echo ""
+echo "=== [3/3] Báo Cáo Tổng Hợp Điểm Số 5 Seeds (Mean ± Std) ==="
+
+python3 -c "
+import json, glob, os, csv
+import numpy as np
+
+run_root = '$RUN_ROOT'
+model_name = '$MODEL_NAME'
+seeds = [1234, 1098, 1024, 2026, 6868]
+
+# Tìm các file metrics.json hoặc summary.json được sinh ra cho từng seed
+seed_summaries = {}
+for s in seeds:
+    matches = glob.glob(os.path.join(run_root, f'*{model_name}*seed{s}*/**/metrics.json'), recursive=True)
+    if not matches:
+        matches = glob.glob(os.path.join(run_root, f'*{model_name}*seed_{s}*/**/metrics.json'), recursive=True)
+    if not matches:
+        matches = glob.glob(os.path.join(run_root, f'*{model_name}*seed{s}*/**/summary.json'), recursive=True)
+    if not matches:
+        # Tìm mở rộng nếu tên thư mục không chứa seed
+        all_jsons = glob.glob(os.path.join(run_root, '**/metrics.json'), recursive=True) + glob.glob(os.path.join(run_root, '**/summary.json'), recursive=True)
+        for sm in all_jsons:
+            try:
+                data = json.load(open(sm))
+                ckpt_meta = data.get('checkpoint_metadata', {})
+                if str(ckpt_meta.get('seed')) == str(s) or str(data.get('seed')) == str(s):
+                    matches = [sm]
+                    break
+            except Exception:
+                pass
+    if matches:
+        raw_data = json.load(open(matches[-1]))
+        if 'summary' in raw_data and isinstance(raw_data['summary'], dict) and 'scar' in raw_data['summary']:
+            merged = dict(raw_data['summary'])
+            merged.update(raw_data)
+            seed_summaries[s] = merged
+        else:
+            seed_summaries[s] = raw_data
+
+print('=' * 88)
+print(f'📊 BẢNG TỔNG HỢP HIỆU NĂNG 5 SEEDS CHO MÔ HÌNH: AWSnet')
+print(f'Số seed hoàn thành đánh giá: {len(seed_summaries)} / 5 seeds: {list(seed_summaries.keys())}')
+print('=' * 88)
+
+if not seed_summaries:
+    print('⚠️ Không tìm thấy file metrics.json hoặc summary.json nào. Vui lòng kiểm tra lại quá trình test.')
+else:
+    metrics_def = [
+        ('Cơ tim lành (Myocardium) Dice', 'normal_myocardium', 'mean_dice', True),
+        ('Phù nề (Edema) Dice', 'edema', 'mean_dice', True),
+        ('Sẹo nhồi máu (Scar) Dice', 'scar', 'mean_dice', True),
+        ('Phù nề gộp {2,3} Dice', 'edema_inclusive', 'mean_dice', True),
+        ('Toàn bộ vòng cơ tim Dice', 'myocardial_ring', 'mean_dice', True),
+        ('HD95 Sẹo nhồi máu (voxel)', 'scar', 'mean_hd95_voxel', False),
+        ('HD95 Phù nề (voxel)', 'edema', 'mean_hd95_voxel', False),
+        ('ASSD Sẹo nhồi máu (voxel)', 'scar', 'mean_asd_voxel', False),
+    ]
+
+    header = f'{\"Chỉ số / Vùng giải phẫu\":<32} | ' + ' | '.join([f'Seed {s:<5}' for s in seed_summaries.keys()]) + f' | {\"MEAN ± STD\":<18}'
+    print(header)
+    print('-' * 88)
+
+    export_rows = []
+
+    for title, reg, met, is_pct in metrics_def:
+        row_vals = []
+        row_strs = []
+        for s, d in seed_summaries.items():
+            val = d.get(reg, {}).get(met)
+            if val is not None:
+                calc_val = val * 100 if is_pct else val
+                row_vals.append(calc_val)
+                row_strs.append(f'{calc_val:6.2f}')
+            else:
+                row_strs.append('   N/A')
+        
+        if row_vals:
+            mean = np.mean(row_vals)
+            std = np.std(row_vals)
+            unit = '%' if is_pct else ' vox'
+            stat_str = f'{mean:6.2f} ± {std:4.2f}{unit}'
+        else:
+            stat_str = 'N/A'
+            mean, std = 0, 0
+            
+        print(f'{title:<32} | ' + ' | '.join(row_strs) + f' | {stat_str}')
+        export_rows.append({'Metric': title, 'Mean': round(mean, 2), 'Std': round(std, 2)})
+
+    print('-' * 88)
+    
+    # Chỉ số tổng hợp bệnh lý
+    for label, key in [('⭐ Avg Pathology Dice', 'avg_pathology_dice'), ('⭐ Avg Pathology Inclusive Dice', 'avg_pathology_inclusive_dice')]:
+        row_vals = []
+        row_strs = []
+        for s, d in seed_summaries.items():
+            val = d.get(key)
+            if val is not None:
+                calc_val = val * 100
+                row_vals.append(calc_val)
+                row_strs.append(f'{calc_val:6.2f}')
+            else:
+                row_strs.append('   N/A')
+        if row_vals:
+            mean = np.mean(row_vals)
+            std = np.std(row_vals)
+            stat_str = f'{mean:6.2f} ± {std:4.2f}%'
+        else:
+            stat_str = 'N/A'
+            mean, std = 0, 0
+        print(f'{label:<32} | ' + ' | '.join(row_strs) + f' | {stat_str}')
+        export_rows.append({'Metric': label, 'Mean': round(mean, 2), 'Std': round(std, 2)})
+
+    print('=' * 88)
+
+    # Lưu báo cáo chính thức ra file CSV trên Google Drive
+    out_csv = os.path.join(run_root, f'Bao_Cao_5Seeds_AWSnet.csv')
+    with open(out_csv, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['Metric', 'Mean', 'Std'])
+        writer.writeheader()
+        writer.writerows(export_rows)
+    print(f'✅ Đã lưu bảng báo cáo khoa học tại: {out_csv}')
+"

@@ -9,7 +9,7 @@ class get_one_hot(nn.Module):
 	def	forward(self,label, N):
 		size = list(label.size())
 		label = label.view(-1)	
-		ones = torch.sparse.torch.eye(N)
+		ones = torch.eye(N, device=label.device)
 		ones = ones.index_select(0, label)	
 		size.append(N)	
 		return ones.view(*size).permute(2,0,1)
@@ -41,26 +41,22 @@ class MultiDiceLoss(nn.Module):
 	def forward(self, input, target, weights=None):
 		input = F.softmax(input,dim=1)  
 		N= target.shape[0]  
-		each_mapclass=[]
-		each_diceloss=[] 
-		one_hot=get_one_hot()
-		for i in range(N):  
-			each_map=target[i,:]  
-			each_map=each_map.squeeze(0)
-			each_mapp=one_hot(each_map.cpu(),self.num_classes) 
-			each_mapp=each_mapp.unsqueeze(0) 
-			each_mapclass.append(each_mapp)
-		output_target=torch.cat(each_mapclass,dim=0).cuda()
+		device = input.device
+		target = target.to(device)
+		if target.dim() == 4 and target.size(1) == 1:
+			target = target.squeeze(1)
+		output_target = F.one_hot(target.long(), num_classes=self.num_classes).permute(0, 3, 1, 2).float()
 		C = input.shape[1]
 		if weights is None:
-			weights = torch.ones(C)
+			weights = torch.ones(C, device=device)
+		else:
+			weights = torch.as_tensor(weights, device=device)
 		dice = DiceLoss()
 		totalLoss = 0
 		for i in range(C):
 			diceLoss = dice(input[:,i], output_target[:,i])
 			if weights is not None:
 				diceLoss *= weights[i]
-			each_diceloss.append(diceLoss)
 			totalLoss += diceLoss
 		return totalLoss
 
@@ -77,8 +73,11 @@ class LossPRSnet_dicece:
 		dc_loss1 = self.criterion0(outputs1, targets1)
 		dc_loss2 = self.criterion0(outputs2, targets2)
 		dc_loss3 = self.criterion0(outputs3, targets3)
-		outputs0,outputs1,outputs2,outputs3 = outputs0.squeeze(dim=1),outputs1.squeeze(dim=1),outputs2.squeeze(dim=1),outputs3.squeeze(dim=1)
-		targets0,targets1,targets2,targets3 = targets0.squeeze(dim=1),targets1.squeeze(dim=1),targets2.squeeze(dim=1),targets3.squeeze(dim=1),
+		if outputs0.size(1) == 1:
+			outputs0,outputs1,outputs2,outputs3 = outputs0.squeeze(dim=1),outputs1.squeeze(dim=1),outputs2.squeeze(dim=1),outputs3.squeeze(dim=1)
+		if targets0.dim() == 4 and targets0.size(1) == 1:
+			targets0,targets1,targets2,targets3 = targets0.squeeze(dim=1),targets1.squeeze(dim=1),targets2.squeeze(dim=1),targets3.squeeze(dim=1)
+		targets0,targets1,targets2,targets3 = targets0.long(), targets1.long(), targets2.long(), targets3.long()
 		ce_loss0 = self.criterion1(outputs0, targets0)
 		ce_loss1 = self.criterion1(outputs1, targets1)
 		ce_loss2 = self.criterion1(outputs2, targets2)

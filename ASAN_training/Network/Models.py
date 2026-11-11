@@ -154,10 +154,15 @@ class AttU_Net(nn.Module):
         #self.active = torch.nn.Sigmoid()
 
 
-    def forward(self,img0,img1,img2):
-        # input_img=torch.cat([img0,img1,img2],1)
-        input_img=torch.cat([img1,img2],1)
-        # input_img = img2
+    def forward(self, *images):
+        if len(images) == 1:
+            input_img = images[0]
+        elif len(images) == 3:
+            input_img = torch.cat(images, dim=1)
+        elif len(images) == 2:
+            input_img = torch.cat(images, dim=1)
+        else:
+            raise ValueError(f"Expected 1, 2, or 3 image tensors, got {len(images)}")
         e1 = self.Conv1(input_img)
 
         e2 = self.Maxpool1(e1)
@@ -205,10 +210,26 @@ class AttU_Net(nn.Module):
             output2 = self.final1(self.up(d3))
             output1 = self.final(d2)
             output = output1
-            return output4, output3, output2, output1 , output
-        else :
+            return output4, output3, output2, output1, output
+        else:
             output = self.final(d2)
             return output
+
+class conv_block_nested(nn.Module):
+    def __init__(self, in_ch, mid_ch, out_ch):
+        super(conv_block_nested, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1, bias=True),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, out_ch, kernel_size=3, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
 
 class NestedUNet(nn.Module):
     """
@@ -253,9 +274,15 @@ class NestedUNet(nn.Module):
         # self.final = nn.Conv2d(filters[0], out_ch, kernel_size=1)
 
 
-    def forward(self,img0,img1,img2):
-        # input_img=torch.cat([img0,img1,img2],1)
-        input_img=torch.cat([img1,img2],1)
+    def forward(self, *images):
+        if len(images) == 1:
+            input_img = images[0]
+        elif len(images) == 3:
+            input_img = torch.cat(images, dim=1)
+        elif len(images) == 2:
+            input_img = torch.cat(images, dim=1)
+        else:
+            raise ValueError(f"Expected 1, 2, or 3 image tensors, got {len(images)}")
         
         x0_0 = self.conv0_0(input_img)
         x1_0 = self.conv1_0(self.pool(x0_0))
@@ -282,8 +309,8 @@ class NestedUNet(nn.Module):
             output2 = self.final1(self.Up(x1_3))
             output1 = self.final(x0_4)
             output = output1
-            return output4, output3, output2, output1 , output
-        else :
+            return output4, output3, output2, output1, output
+        else:
             output = self.final(x0_4)
             return output
         # output = self.final(x0_4)

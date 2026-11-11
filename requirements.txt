@@ -1,0 +1,9 @@
+torch
+torchvision
+numpy
+scipy
+h5py
+pandas
+nibabel
+tqdm
+gdown

@@ -1,0 +1,241 @@
+#!/bin/bash
+# ==============================================================================
+# Script cài đặt môi trường và Huấn luyện SONG SONG 5 SEEDS tối ưu cho NVIDIA A100
+# Mô hình: AWSnet (Attention U-Net with Auto-Weighted Deep Supervision, 8.73M params)
+# GPU: NVIDIA A100 (40GB / 80GB VRAM) trên Google Colab / Cloud
+# Repository: https://github.com/mintduckk24/AWSnet.git
+# 5 Seeds chuẩn hóa: [1234, 1098, 1024, 2026, 6868]
+# Quản lý: 5 Terminal độc lập thông qua tmux (Session: train5_awsnet)
+# Giao thức: MyoPS380 — 304 train / 76 test — 300 epochs — Không Validation
+# ==============================================================================
+
+set -e
+
+echo "=== [1/7] Kiểm tra và Kích hoạt GPU NVIDIA A100 ==="
+cd /content
+
+# Tự động liên kết thư viện driver NVIDIA nếu có trên Colab (/usr/lib64-nvidia)
+if [ -d "/usr/lib64-nvidia" ]; then
+    if ! grep -q "/usr/lib64-nvidia" /etc/ld.so.conf.d/nvidia.conf 2>/dev/null; then
+        echo "/usr/lib64-nvidia" >> /etc/ld.so.conf.d/nvidia.conf
+        ldconfig 2>/dev/null || true
+    fi
+    export LD_LIBRARY_PATH=/usr/lib64-nvidia:${LD_LIBRARY_PATH}
+fi
+if ! grep -q "/usr/lib64-nvidia" ~/.bashrc 2>/dev/null; then
+    echo 'export LD_LIBRARY_PATH=/usr/lib64-nvidia:$LD_LIBRARY_PATH' >> ~/.bashrc 2>/dev/null || true
+fi
+
+if ! command -v nvidia-smi &> /dev/null; then
+    echo "⚠️ CẢNH BÁO: Chưa tìm thấy NVIDIA GPU. Hãy kiểm tra lại Runtime > Change runtime type > A100 GPU trên Colab!"
+else
+    echo "Thông tin GPU hiện tại:"
+    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
+fi
+
+# Tối ưu hóa cấp phát bộ nhớ CUDA cho A100 (chống phân mảnh khi chạy song song 5 tiến trình)
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+echo "=== [2/7] Mount Google Drive (Lưu Checkpoints & Logs an toàn) ==="
+python3 -c "
+import os
+if not os.path.exists('/content/drive/MyDrive'):
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive')
+        print('✅ Mount Google Drive thành công!')
+    except Exception as e:
+        print('⚠️ Không thể mount Drive tự động (bỏ qua nếu không dùng):', e)
+" || true
+
+echo "=== [3/7] Thiết lập Repository AWSnet ==="
+REPO_URL="https://github.com/mintduckk24/AWSnet.git"
+
+if [ -f "./train.py" ] && [ -d "./models" ]; then
+    echo "✅ Đang đứng trực tiếp trong thư mục AWSnet."
+elif [ -d "/content/AWSnet" ]; then
+    echo "✅ Thư mục /content/AWSnet đã tồn tại."
+elif [ -f "/content/AWSnet.zip" ]; then
+    echo "✅ Phát hiện file AWSnet.zip tại /content/. Đang giải nén..."
+    unzip -q -o "/content/AWSnet.zip" -d /content/
+elif [ -f "/content/drive/MyDrive/AWSnet.zip" ]; then
+    echo "✅ Phát hiện file AWSnet.zip trên Google Drive. Đang giải nén..."
+    unzip -q -o "/content/drive/MyDrive/AWSnet.zip" -d /content/
+elif [ -d "/content/drive/MyDrive/AWSnet" ]; then
+    echo "✅ Phát hiện thư mục AWSnet trên Google Drive. Đang sao chép vào /content/AWSnet..."
+    cp -r "/content/drive/MyDrive/AWSnet" /content/AWSnet
+else
+    echo "Đang clone repository từ $REPO_URL..."
+    git clone "$REPO_URL" /content/AWSnet || {
+        echo "❌ Chưa thể clone từ $REPO_URL."
+        echo "👉 Bạn có thể kéo thả file AWSnet.zip vào khung Explorer của VS Code (/content/) rồi chạy lại."
+        exit 1
+    }
+fi
+
+if [ -d "/content/AWSnet" ]; then
+    cd /content/AWSnet
+fi
+AWSNET_DIR="/content/AWSnet"
+
+echo "=== [4/7] Cài đặt Dependencies cho AWSnet & tmux ==="
+python3 -m pip install --upgrade pip -q
+if [ -f "requirements.txt" ]; then
+    python3 -m pip install -r requirements.txt gdown -q
+else
+    python3 -m pip install torch torchvision numpy scipy h5py nibabel pandas tqdm gdown -q
+fi
+command -v tmux &> /dev/null || (apt-get update -qq && apt-get install -y tmux)
+
+# Cấu hình tmux hỗ trợ con lăn chuột và hiển thị rõ 5 tab
+cat << 'EOF' > /root/.tmux.conf
+set -g mouse on
+set -g base-index 1
+setw -g pane-base-index 1
+set -g status-bg colour235
+set -g status-fg colour136
+set -g status-left '#[fg=green][A100-AWSnet] '
+set -g status-right '#[fg=yellow]%H:%M:%S'
+EOF
+
+echo "=== [5/7] Tải Dataset từ Thư mục Google Drive ==="
+DATASET_FOLDER_ID="13T6892xy-pUwC1BSjGl4sRxoypMu-SIS"
+DOWNLOAD_DIR="/content/dataset_download"
+TARGET_DATASET_DIR="/content/AWSnet/MyoPS380_dataset"
+
+mkdir -p "$DOWNLOAD_DIR"
+mkdir -p "$TARGET_DATASET_DIR"
+
+# Kiểm tra nếu dataset đã có sẵn trên Google Drive
+DRIVE_DATASET_DIR="/content/drive/MyDrive/MyoPS380_dataset"
+if [ -d "$DRIVE_DATASET_DIR/Processed_data/bSSFP" ]; then
+    echo "✅ Phát hiện dataset sẵn trên Google Drive tại $DRIVE_DATASET_DIR/Processed_data"
+    LOCAL_DATASET="$DRIVE_DATASET_DIR/Processed_data"
+elif [ -d "/content/drive/MyDrive/Processed_data/bSSFP" ]; then
+    echo "✅ Phát hiện dataset sẵn trên Google Drive tại /content/drive/MyDrive/Processed_data"
+    LOCAL_DATASET="/content/drive/MyDrive/Processed_data"
+else
+    if [ -z "$(ls -A "$DOWNLOAD_DIR" 2>/dev/null)" ] && [ -z "$(ls -A "$TARGET_DATASET_DIR" 2>/dev/null)" ]; then
+        echo "Đang tải thư mục dataset từ Google Drive (Folder ID: $DATASET_FOLDER_ID)..."
+        gdown --folder --id "$DATASET_FOLDER_ID" -O "$DOWNLOAD_DIR" --remaining-ok || true
+    fi
+
+    for zipfile in $(find "$DOWNLOAD_DIR" -maxdepth 2 -name "*.zip" 2>/dev/null); do
+        echo "Đang giải nén $zipfile..."
+        command -v unzip &>/dev/null || (apt-get update -qq && apt-get install -y unzip)
+        unzip -q -o "$zipfile" -d "$TARGET_DATASET_DIR/"
+    done
+
+    if [ -d "$DOWNLOAD_DIR/Processed_data" ]; then
+        cp -r "$DOWNLOAD_DIR/Processed_data" "$TARGET_DATASET_DIR/"
+    fi
+
+    # Ưu tiên tìm thư mục Processed_data chứa train_npz (tránh nhầm sang Raw_data)
+    FOUND_TRAIN_NPZ=$(find "$TARGET_DATASET_DIR" "$DOWNLOAD_DIR" /content -type d -name "train_npz" 2>/dev/null | grep -i "bSSFP" | head -n 1)
+    if [ -n "$FOUND_TRAIN_NPZ" ]; then
+        LOCAL_DATASET=$(dirname $(dirname "$FOUND_TRAIN_NPZ"))
+        echo "✅ Đã xác định thư mục dataset chuẩn tại: $LOCAL_DATASET"
+    elif [ -d "$TARGET_DATASET_DIR/Processed_data/bSSFP" ]; then
+        LOCAL_DATASET="$TARGET_DATASET_DIR/Processed_data"
+    elif [ -d "$DOWNLOAD_DIR/Processed_data/bSSFP" ]; then
+        LOCAL_DATASET="$DOWNLOAD_DIR/Processed_data"
+    else
+        LOCAL_DATASET="/content/AWSnet/MyoPS380_dataset/Processed_data"
+        echo "⚠️ Chưa phát hiện thư mục bSSFP, đặt mặc định: $LOCAL_DATASET"
+    fi
+fi
+
+# Manifest 304 train / 76 test chuẩn No-Val
+if [ -d "$AWSNET_DIR/dataset/splits/myops380_no_val" ]; then
+    SPLIT_DIR="$AWSNET_DIR/dataset/splits/myops380_no_val"
+else
+    SPLIT_DIR="/content/SCAR/preprocessing/splits/myops380_no_val"
+fi
+echo "✅ Sử dụng manifest chuẩn No-Val: $SPLIT_DIR"
+
+echo "=== [6/7] Thiết lập Cấu hình Huấn luyện Tối ưu cho A100 ==="
+RUN_ROOT="/content/drive/MyDrive/AWSnet_Runs"
+LOGS_DIR="$RUN_ROOT/parallel_logs_awsnet"
+mkdir -p "$LOGS_DIR"
+
+# Danh sách 5 Seeds chuẩn hóa theo yêu cầu
+SEEDS=(1234 1098 1024 2026 6868)
+
+echo "Mô hình: AWSnet (Attention U-Net with Auto-Weighted Deep Supervision, 8.73M params)"
+echo "5 Seeds khởi chạy đồng thời: ${SEEDS[*]}"
+echo "Thư mục lưu Checkpoints: $RUN_ROOT"
+echo "Thư mục lưu Logs: $LOGS_DIR"
+
+echo "=== [7/7] Khởi động 5 Terminal TMUX chạy 5 Seeds Song Song ==="
+
+# Hủy session cũ nếu đang tồn tại
+tmux kill-session -t train5_awsnet 2>/dev/null || true
+
+# Tạo session tmux mới với terminal đầu tiên (Seed 1)
+FIRST_SEED=${SEEDS[0]}
+FIRST_LOG="$LOGS_DIR/train_awsnet_seed_${FIRST_SEED}.log"
+
+echo "🚀 [1/5] Khởi động Terminal 1 (Seed $FIRST_SEED)..."
+tmux new-session -d -s train5_awsnet -n "awsnet_${FIRST_SEED}" \
+    "cd $AWSNET_DIR && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+     python3 train.py \
+        --data_dir '$LOCAL_DATASET' \
+        --split_dir '$SPLIT_DIR' \
+        --save_dir '$RUN_ROOT' \
+        --seed $FIRST_SEED \
+        --batch_size 16 \
+        --accum_steps 1 \
+        --max_epochs 300 \
+        --base_lr 0.0003333 \
+        --weight_decay 0.0001 \
+        --num_workers 4 \
+        --amp auto \
+        --resume 2>&1 | tee '$FIRST_LOG'"
+
+# Khởi tạo tiếp 4 terminal (window) cho 4 seeds còn lại
+for i in {1..4}; do
+    SEED=${SEEDS[$i]}
+    INDEX=$((i + 1))
+    LOG_FILE="$LOGS_DIR/train_awsnet_seed_${SEED}.log"
+    echo "🚀 [$INDEX/5] Khởi động Terminal $INDEX (Seed $SEED)..."
+    
+    tmux new-window -t train5_awsnet -n "awsnet_${SEED}" \
+        "cd $AWSNET_DIR && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+         python3 train.py \
+            --data_dir '$LOCAL_DATASET' \
+            --split_dir '$SPLIT_DIR' \
+            --save_dir '$RUN_ROOT' \
+            --seed $SEED \
+            --batch_size 16 \
+            --accum_steps 1 \
+            --max_epochs 300 \
+            --base_lr 0.0003333 \
+            --weight_decay 0.0001 \
+            --num_workers 4 \
+            --amp auto \
+            --resume 2>&1 | tee '$LOG_FILE'"
+done
+
+echo ""
+echo "=============================================================================="
+echo "🎉 ĐÃ KHỞI CHẠY THÀNH CÔNG 5 SEEDS AWSNET SONG SONG TRÊN 5 TERMINAL TMUX!"
+echo "=============================================================================="
+echo ""
+echo "💡 CÁCH XEM VÀ CHUYỂN ĐỔI GIỮA 5 TERMINAL TRÊN COLAB CLI:"
+echo "  1. Vào xem giao diện tmux chứa 5 terminal:"
+echo "     tmux attach -t train5_awsnet"
+echo ""
+echo "  2. Phím tắt chuyển nhanh giữa các Terminal bên trong tmux:"
+echo "     - Bấm: Ctrl + B, sau đó bấm 1 (xem Seed 1234)"
+echo "     - Bấm: Ctrl + B, sau đó bấm 2 (xem Seed 1098)"
+echo "     - Bấm: Ctrl + B, sau đó bấm 3 (xem Seed 1024)"
+echo "     - Bấm: Ctrl + B, sau đó bấm 4 (xem Seed 2026)"
+echo "     - Bấm: Ctrl + B, sau đó bấm 5 (xem Seed 6868)"
+echo "     - Thoát ra màn hình ngoài (detach): Bấm Ctrl + B, sau đó bấm D"
+echo ""
+echo "  3. Hoặc xem nhanh tiến độ cả 5 tiến trình từ bên ngoài (không cần vào tmux):"
+echo "     tail -n 2 -q $LOGS_DIR/*.log"
+echo ""
+echo "  4. Theo dõi mức tiêu thụ GPU A100 thời gian thực:"
+echo "     watch -n 2 nvidia-smi"
+echo "=============================================================================="
