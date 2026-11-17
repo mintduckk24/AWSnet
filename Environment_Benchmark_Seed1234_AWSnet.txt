@@ -297,6 +297,7 @@ if [ -f "$CKPT_FILE" ]; then
         --data_dir "$LOCAL_DATASET" \
         --split_dir "$SPLIT_DIR" \
         --dataset "$DATASET_NAME" \
+        --label_order "$LABEL_ORDER" \
         --output_dir "/content/AWSnet/test_predictions_seed${SEED}" \
         --batch_size 8 \
         --amp none
