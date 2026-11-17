@@ -238,6 +238,8 @@ def train(
     data_dir: str | Path | None = None,
     split_dir: str | Path | None = None,
     save_dir: str | Path | None = None,
+    dataset: str = "auto",
+    label_order: str = "auto",
     batch_size: int = 16,
     accum_steps: int = 1,
     max_epochs: int = 300,
@@ -249,14 +251,19 @@ def train(
     device_name: str | None = None,
     amp: str = "auto",
     num_workers: int = 4,
+    pin_memory: bool = True,
     clip_grad: float = 0.0,
     log_interval: int = 20,
     max_batches: int | None = None,
 ) -> Path:
-    """Runs standard 300-epoch training strictly conforming to Promt_train_test_no_val.txt."""
-    resolved_data = resolve_data_root(data_dir)
-    resolved_split = resolve_split_dir(split_dir)
+    """Runs standard 300-epoch training supporting both MyoPS380 and MyoPS++ benchmarks."""
+    resolved_data = resolve_data_root(data_dir, dataset=dataset)
+    resolved_split = resolve_split_dir(split_dir, dataset=dataset, data_root=resolved_data)
     resolved_save = resolve_save_dir(save_dir)
+
+    is_myopspp = "myopspp" in str(dataset).lower() or "myopspp" in str(resolved_data).lower()
+    dataset_id = "myopspp_unet2d_roi128_1mm" if is_myopspp else "myops380"
+    benchmark_protocol_id = "myopspp_roi128_train64_test16_no_val_v1" if is_myopspp else "myops380_train304_test76_last_v1"
 
     train_manifest = resolved_split / "train.txt"
     if not train_manifest.is_file():
@@ -270,7 +277,7 @@ def train(
     else:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     amp_dtype = resolve_amp(amp, device)
-    print(f"[AWSnet] Execution device: {device} | AMP mode: {amp} (dtype: {amp_dtype})")
+    print(f"[AWSnet] Execution device: {device} | AMP mode: {amp} (dtype: {amp_dtype}) | Dataset: {dataset_id}")
 
     # 2. Seed & Determinism
     set_seed(seed=seed, deterministic=True)
@@ -283,16 +290,19 @@ def train(
         split_dir=resolved_split,
         split="train",
         img_size=(128, 128),
+        dataset=dataset_id,
+        label_order=label_order,
     )
-    print(f"[AWSnet] Loaded train dataset: {len(train_dataset)} slices (304 patients, zero validation)")
+    print(f"[AWSnet] Loaded {dataset_id} train dataset: {len(train_dataset)} slices (zero validation)")
 
+    use_pin_memory = bool(pin_memory and device.type == "cuda")
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,  # Keep all 1,972 slices
+        pin_memory=use_pin_memory,
+        drop_last=False,
         persistent_workers=False,
         worker_init_fn=seed_worker,
         generator=g,
@@ -305,12 +315,14 @@ def train(
 
     print(
         f"[AWSnet] Training Protocol & Budget:\n"
-        f"  - protocol_id: myops380_train304_test76_last_v1\n"
+        f"  - dataset_id: {dataset_id}\n"
+        f"  - protocol_id: {benchmark_protocol_id}\n"
         f"  - model_id: awsnet\n"
         f"  - max_epochs: {max_epochs}\n"
         f"  - batch_size: {batch_size}, accum_steps: {accum_steps} (Effective BS: {effective_bs})\n"
         f"  - batches_per_epoch: {batches_per_epoch}, total_updates: {total_updates}\n"
         f"  - base_lr: {base_lr}, weight_decay: {weight_decay}\n"
+        f"  - pin_memory: {use_pin_memory}, num_workers: {num_workers}\n"
         f"  - manifest_hash (train.txt): {manifest_hash[:16]}..."
     )
 
@@ -424,7 +436,8 @@ def train(
         state = {
             "model_id": "awsnet",
             "model_architecture": "AWSnet (Attention U-Net with Auto-Weighted Deep Supervision)",
-            "benchmark_protocol": "myops380_train304_test76_last_v1",
+            "dataset_id": dataset_id,
+            "benchmark_protocol": benchmark_protocol_id,
             "epoch": completed_epochs,
             "completed_epochs": completed_epochs,
             "planned_epochs": max_epochs,
@@ -466,14 +479,29 @@ def train(
         os.replace(temp_ckpt, ckpt_path)
 
     total_training_duration = time.perf_counter() - total_training_start
-    print(f"\n[AWSnet] Training complete in {total_training_duration/60:.2f} minutes.")
+    total_training_hours = round(total_training_duration / 3600.0, 4)
+    epoch_times = [m["epoch_wall_time"] for m in history if "epoch_wall_time" in m]
+    avg_epoch_time_6_to_300 = (
+        round(float(np.mean(epoch_times[5:])), 2)
+        if len(epoch_times) > 5
+        else (round(float(np.mean(epoch_times)), 2) if epoch_times else 0.0)
+    )
+    peak_train_vram_gb = (
+        round(torch.cuda.max_memory_allocated(device) / (1024 ** 3), 3)
+        if device.type == "cuda"
+        else 0.0
+    )
+
+    print(f"\n[AWSnet] Training complete in {total_training_duration/60:.2f} minutes ({total_training_hours} hrs).")
+    print(f"[AWSnet] Avg Time/Epoch (epochs 6..{max_epochs}): {avg_epoch_time_6_to_300}s | Peak VRAM: {peak_train_vram_gb} GB")
     print(f"[AWSnet] Checkpoint saved: {ckpt_path.resolve()}")
 
-    # Save summary metadata
+    # Save summary metadata conforming to Quy tắc đo hiệu suất tính toán.txt
     summary_path = resolved_save / f"training_summary_seed{seed}.json"
     summary_data = {
         "model_id": "awsnet",
-        "benchmark_protocol": "myops380_train304_test76_last_v1",
+        "dataset_id": dataset_id,
+        "benchmark_protocol": benchmark_protocol_id,
         "seed": seed,
         "max_epochs": max_epochs,
         "completed_epochs": max_epochs,
@@ -484,6 +512,10 @@ def train(
         "amp_dtype": str(amp_dtype),
         "trainable_parameters": total_params,
         "total_training_seconds": total_training_duration,
+        "total_training_hours": total_training_hours,
+        "avg_epoch_time_epoch_6_to_300_s": avg_epoch_time_6_to_300,
+        "peak_train_vram_gb": peak_train_vram_gb,
+        "epoch_times": epoch_times,
         "final_loss": history[-1]["loss"] if history else None,
         "checkpoint_file": str(ckpt_path.resolve()),
     }
@@ -494,10 +526,12 @@ def train(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="AWSnet MyoPS380 Training Engine")
+    parser = argparse.ArgumentParser(description="AWSnet MyoPS380 / MyoPS++ Training Engine")
     parser.add_argument("--data_dir", "--data-root", "--data_root", dest="data_dir", type=str, default=None, help="Root directory of preprocessed dataset")
     parser.add_argument("--split_dir", "--list-dir", "--list_dir", dest="split_dir", type=str, default=None, help="Directory containing split txt files")
     parser.add_argument("--save_dir", "--run-root", "--run_root", "--output-dir", "--output_dir", dest="save_dir", type=str, default=None, help="Directory to save checkpoints")
+    parser.add_argument("--dataset", type=str, default="auto", help="Dataset identifier: auto, myops380, or myopspp_unet2d_roi128_1mm")
+    parser.add_argument("--label_order", "--label-order", dest="label_order", type=str, default="auto", choices=["auto", "legacy", "canonical"], help="Source label ordering convention")
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=16, help="Physical batch size")
     parser.add_argument("--accum_steps", "--accum-steps", dest="accum_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max_epochs", "--epochs", "--max-epochs", dest="max_epochs", type=int, default=300, help="Maximum epochs (default: 300)")
@@ -515,6 +549,7 @@ def parse_args():
     )
     parser.add_argument("--device", type=str, default=None, help="Execution device (e.g. cuda:0 or cpu)")
     parser.add_argument("--num_workers", "--num-workers", dest="num_workers", type=int, default=4, help="DataLoader workers count (default: 4)")
+    parser.add_argument("--pin_memory", "--pin-memory", dest="pin_memory", action=argparse.BooleanOptionalAction, default=True, help="Enable pin_memory in DataLoader")
     parser.add_argument("--log_interval", "--log-every", dest="log_interval", type=int, default=20, help="Batch logging interval")
     parser.add_argument("--amp", type=str, default="auto", choices=["auto", "none", "fp16", "bf16"], help="Mixed precision mode (default: auto)")
     parser.add_argument("--clip_grad", "--clip-grad", dest="clip_grad", type=float, default=0.0, help="Gradient clipping norm (0.0 to disable)")
@@ -529,6 +564,8 @@ if __name__ == "__main__":
         data_dir=args.data_dir,
         split_dir=args.split_dir,
         save_dir=args.save_dir,
+        dataset=args.dataset,
+        label_order=args.label_order,
         batch_size=args.batch_size,
         accum_steps=args.accum_steps,
         max_epochs=args.max_epochs,
@@ -540,6 +577,7 @@ if __name__ == "__main__":
         device_name=args.device,
         amp=args.amp,
         num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
         clip_grad=args.clip_grad,
         log_interval=args.log_interval,
         max_batches=args.max_batches,

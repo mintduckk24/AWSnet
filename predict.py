@@ -70,17 +70,18 @@ def run_prediction(
     data_dir: str | Path | None = None,
     split_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
+    dataset: str = "auto",
     device_name: str | None = None,
     amp: str = "auto",
     allow_incomplete: bool = False,
 ) -> Path:
-    """Generates canonical test predictions for all 76 cases in test_vol.txt."""
+    """Generates canonical test predictions for all test cases."""
     ckpt_path = Path(checkpoint_path)
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
 
-    resolved_data = resolve_data_root(data_dir)
-    resolved_split = resolve_split_dir(split_dir)
+    resolved_data = resolve_data_root(data_dir, dataset=dataset)
+    resolved_split = resolve_split_dir(split_dir, dataset=dataset, data_root=resolved_data)
 
     if output_dir is not None:
         out_dir = Path(output_dir)
@@ -105,6 +106,12 @@ def run_prediction(
             "Use --allow_incomplete to override for dry-run testing."
         )
 
+    if dataset == "auto":
+        is_myopspp = "myopspp" in str(ckpt.get("dataset_id", "")).lower() or "myopspp" in str(resolved_data).lower()
+        dataset_id = "myopspp_unet2d_roi128_1mm" if is_myopspp else "myops380"
+    else:
+        dataset_id = dataset
+
     base_filters = ckpt.get("base_filters", 32)
     model = AWSnet(
         in_channels=3,
@@ -125,6 +132,7 @@ def run_prediction(
         data_dir=resolved_data,
         split_dir=resolved_split,
         split_file="test_vol.txt",
+        dataset=dataset_id,
     )
     num_cases = len(test_dataset)
     print(f"[AWSnet Predict] Running single-pass inference on {num_cases} test cases...")
@@ -162,11 +170,12 @@ def run_prediction(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="AWSnet MyoPS380 Inference Engine")
+    parser = argparse.ArgumentParser(description="AWSnet Inference Engine")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to awsnet_seed<seed>.pt")
-    parser.add_argument("--data_dir", type=str, default=None, help="Root directory of preprocessed dataset")
-    parser.add_argument("--split_dir", type=str, default=None, help="Directory containing split txt files")
-    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for predictions")
+    parser.add_argument("--data_dir", "--data-root", dest="data_dir", type=str, default=None, help="Root directory of preprocessed dataset")
+    parser.add_argument("--split_dir", "--list-dir", dest="split_dir", type=str, default=None, help="Directory containing split txt files")
+    parser.add_argument("--output_dir", "--output-dir", dest="output_dir", type=str, default=None, help="Output directory for predictions")
+    parser.add_argument("--dataset", type=str, default="auto", help="Dataset identifier: auto, myops380, or myopspp_unet2d_roi128_1mm")
     parser.add_argument("--device", type=str, default=None, help="Execution device (e.g. cuda:0 or cpu)")
     parser.add_argument("--amp", type=str, default="auto", choices=["auto", "none", "fp16", "bf16"], help="Mixed precision mode (default: auto)")
     parser.add_argument("--allow_incomplete", action="store_true", help="Allow inference on checkpoints < 300 epochs")
@@ -180,6 +189,7 @@ if __name__ == "__main__":
         data_dir=args.data_dir,
         split_dir=args.split_dir,
         output_dir=args.output_dir,
+        dataset=args.dataset,
         device_name=args.device,
         amp=args.amp,
         allow_incomplete=args.allow_incomplete,

@@ -37,12 +37,13 @@ from utils.paths import resolve_data_root, resolve_split_dir, resolve_save_dir
 
 
 def load_surface_distance_module(scar_root: str | Path | None = None):
-    """Loads SCAR's surface_distance.py or bundled local copy."""
-    candidates = []
+    """Loads bundled local surface_distance.py or reference SCAR copy."""
+    candidates = [
+        Path(__file__).resolve().parent / "utils" / "surface_distance.py",
+    ]
     if scar_root is not None:
         candidates.append(Path(scar_root) / "training" / "metrics" / "surface_distance.py")
     candidates.extend([
-        Path(__file__).resolve().parent / "utils" / "surface_distance.py",
         Path(r"D:\nckh_model\SCAR\training\metrics\surface_distance.py"),
         Path(r"../SCAR/training/metrics/surface_distance.py"),
     ])
@@ -81,11 +82,34 @@ def evaluate(
     device_name: str | None = None,
     amp: str = "auto",
     allow_incomplete: bool = False,
+    dataset: str = "auto",
+    label_order: str = "auto",
 ) -> dict[str, Any]:
-    """Runs prediction and shared evaluation for AWSnet on the 76 MyoPS380 test patients."""
-    resolved_data = resolve_data_root(data_dir)
-    resolved_split = resolve_split_dir(split_dir)
+    """Runs prediction and shared evaluation for AWSnet on MyoPS380 or MyoPS++ test patients."""
+    resolved_data = resolve_data_root(data_dir, dataset=dataset)
+    resolved_split = resolve_split_dir(split_dir, dataset=dataset, data_root=resolved_data)
     surface_dist_mod = load_surface_distance_module(scar_root)
+
+    # Detect dataset identity
+    is_myopspp = (
+        "myopspp" in str(dataset).lower()
+        or (checkpoint is not None and "myopspp" in str(checkpoint).lower())
+        or "myopspp" in str(data_dir).lower()
+        or "myopspp" in str(resolved_data).lower()
+    )
+
+    if dataset == "auto":
+        if checkpoint is not None and Path(checkpoint).is_file():
+            try:
+                ckpt_peek = torch.load(checkpoint, map_location="cpu", weights_only=False)
+                if "dataset_id" in ckpt_peek:
+                    is_myopspp = "myopspp" in str(ckpt_peek["dataset_id"]).lower()
+            except Exception:
+                pass
+        dataset_id = "myopspp_unet2d_roi128_1mm" if is_myopspp else "myops380"
+    else:
+        dataset_id = dataset
+        is_myopspp = "myopspp" in dataset_id.lower()
 
     manifest_name = f"{split}.txt" if not split.endswith(".txt") else split
     test_manifest = resolved_split / manifest_name
@@ -96,10 +120,13 @@ def evaluate(
         data_dir=resolved_data,
         split_dir=resolved_split,
         split_file=manifest_name,
+        dataset=dataset_id,
+        label_order=label_order,
     )
-    expected_cases = len(test_dataset)
-    if expected_cases != 76 and "test" in split:
-        print(f"[WARNING] Expected 76 test cases, but {manifest_name} has {expected_cases}")
+    expected_cases = 16 if is_myopspp else 76
+    actual_cases = len(test_dataset)
+    if actual_cases != expected_cases and "test" in split:
+        print(f"[WARNING] Expected {expected_cases} test cases for {dataset_id}, but {manifest_name} has {actual_cases}")
 
     # Determine execution device and precision
     if device_name is not None:
@@ -218,13 +245,14 @@ def evaluate(
         if pred_vol.dtype != np.uint8:
             pred_vol = pred_vol.astype(np.uint8)
 
-        # Execute shared evaluator dataset_rows for myops380
+        # Execute shared evaluator dataset_rows with spacing for physical distance
         case_rows = surface_dist_mod.dataset_rows(
             prediction=pred_vol,
             target=target_vol,
             case=case_id,
             compute_distance=True,
-            dataset_id="myops380",
+            dataset_id=dataset_id,
+            spacing=item.get("spacing"),
         )
         all_rows.extend(case_rows)
 
@@ -235,7 +263,7 @@ def evaluate(
     print(f"[AWSnet Eval] Finished case evaluations in {elapsed_eval:.2f}s.")
 
     # Step 3: Summarize metrics using SCAR summarize_dataset_rows
-    summary = surface_dist_mod.summarize_dataset_rows(all_rows, dataset_id="myops380")
+    summary = surface_dist_mod.summarize_dataset_rows(all_rows, dataset_id=dataset_id)
 
     # Step 4: Write per_case.csv
     csv_path = eval_out_dir / "per_case.csv"
@@ -247,8 +275,13 @@ def evaluate(
             "region",
             "dice",
             "iou",
+            "hd95",
+            "asd",
+            "hd95_mm",
+            "asd_mm",
             "hd95_voxel",
             "asd_voxel",
+            "hd95_unit",
             "status",
             "precision",
             "recall",
@@ -264,13 +297,18 @@ def evaluate(
     print(f"[AWSnet Eval] Exported per_case.csv: {csv_path}")
 
     # Step 5: Write metrics.json and summary.json with complete metadata
+    distance_unit = "mm" if is_myopspp else "voxel"
+    metric_protocol_id = f"{dataset_id}_roi_mm_v2" if is_myopspp else "myops380_voxel_v3"
+    benchmark_protocol_id = "myopspp_roi128_train64_test16_no_val_v1" if is_myopspp else "myops380_train304_test76_last_v1"
+
     # Flatten summary metrics directly to root level matching SCAR reference
     results_payload = dict(summary)
     results_payload.update({
         "model_id": "awsnet",
-        "benchmark_protocol": "myops380_train304_test76_last_v1",
-        "metric_protocol": "myops380_voxel_v3",
-        "dataset_profile": "myops380",
+        "benchmark_protocol": benchmark_protocol_id,
+        "metric_protocol": metric_protocol_id,
+        "dataset_profile": dataset_id,
+        "distance_unit": distance_unit,
         "test_cases_count": len(all_case_ids),
         "split_manifest_sha256": compute_file_sha256(test_manifest),
         "loss_objective": "AWSnet_LossPRSnet_dicece_0.2CE_1.0Dice_4StageDeepSupervision",
@@ -302,11 +340,11 @@ def evaluate(
 
     # Step 6: Print clean report table
     print("\n" + "=" * 80)
-    print("                    AWSnet MyoPS380 Official Evaluation Report                    ")
+    print(f"            AWSnet {dataset_id.upper()} Official Evaluation Report            ")
     print("=" * 80)
-    print(f"Protocol: myops380_voxel_v3 | Cases: {len(all_case_ids)} | Unit: voxel")
+    print(f"Protocol: {metric_protocol_id} | Cases: {len(all_case_ids)} | Distance Unit: {distance_unit}")
     print("-" * 80)
-    header = f"{'Region':<22} | {'Dice Mean':<10} | {'IoU Mean':<10} | {'HD95 (vox)':<12} | {'ASD (vox)':<10} | {'N (valid)':<8}"
+    header = f"{'Region':<22} | {'Dice Mean':<10} | {'IoU Mean':<10} | {f'HD95 ({distance_unit})':<12} | {f'ASD ({distance_unit})':<10} | {'N (valid)':<8}"
     print(header)
     print("-" * 80)
 
@@ -315,8 +353,8 @@ def evaluate(
             continue
         dice_m = metrics.get("mean_dice", metrics.get("dice_mean"))
         iou_m = metrics.get("mean_iou", metrics.get("iou_mean"))
-        hd95_m = metrics.get("mean_hd95_voxel", metrics.get("hd95_voxel_mean"))
-        asd_m = metrics.get("mean_asd_voxel", metrics.get("asd_voxel_mean"))
+        hd95_m = metrics.get(f"mean_hd95_{distance_unit}", metrics.get("hd95_mean", metrics.get(f"hd95_{distance_unit}_mean", metrics.get("mean_hd95_voxel", metrics.get("mean_hd95_mm")))))
+        asd_m = metrics.get(f"mean_asd_{distance_unit}", metrics.get("asd_mean", metrics.get(f"asd_{distance_unit}_mean", metrics.get("mean_asd_voxel", metrics.get("mean_asd_mm")))))
         n_def = metrics.get("dice_defined_cases", metrics.get("dice_count", 0))
         n_tot = metrics.get("cases", metrics.get("total_cases", 0))
 
@@ -338,12 +376,14 @@ def evaluate(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="AWSnet MyoPS380 Shared Evaluation")
+    parser = argparse.ArgumentParser(description="AWSnet MyoPS380 / MyoPS++ Shared Evaluation")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to awsnet_seed<seed>.pt")
     parser.add_argument("--predictions_dir", type=str, default=None, help="Directory containing pre-generated npz")
     parser.add_argument("--data_dir", "--data-root", "--data_root", dest="data_dir", type=str, default=None, help="Root directory of preprocessed dataset")
     parser.add_argument("--split_dir", "--list-dir", "--list_dir", dest="split_dir", type=str, default=None, help="Directory containing split txt files")
     parser.add_argument("--output_dir", "--output-dir", dest="output_dir", type=str, default=None, help="Output directory for evaluations")
+    parser.add_argument("--dataset", type=str, default="auto", help="Dataset identifier: auto, myops380, or myopspp_unet2d_roi128_1mm")
+    parser.add_argument("--label_order", "--label-order", dest="label_order", type=str, default="auto", choices=["auto", "legacy", "canonical"], help="Source label ordering convention")
     parser.add_argument("--split", type=str, default="test_vol", choices=["test_vol", "val_vol"], help="Split manifest to evaluate (default: test_vol)")
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=8, help="Inference batch size")
     parser.add_argument("--scar_root", type=str, default=None, help="Path to reference SCAR repository")
@@ -361,6 +401,8 @@ def main():
         data_dir=args.data_dir,
         split_dir=args.split_dir,
         output_dir=args.output_dir,
+        dataset=args.dataset,
+        label_order=args.label_order,
         split=args.split,
         batch_size=args.batch_size,
         scar_root=args.scar_root,

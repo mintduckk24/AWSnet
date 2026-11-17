@@ -1,0 +1,319 @@
+#!/bin/bash
+# ==============================================================================
+# SCRIPT MÔI TRƯỜNG DÀNH RIÊNG CHO SEED ĐẶC BIỆT 1234 - MÔ HÌNH AWSNET
+# Mục đích: Huấn luyện và Đo kiểm chuẩn Hiệu năng Tính toán & Độ gọn nhẹ (A100 GPU)
+# Căn cứ quy chuẩn kỹ thuật:
+#   1. "Quy tắc đo hiệu suất tính toán.txt"
+#   2. "Enveronment.txt" (Base environment & dataset preparation)
+#
+# BẢNG THÔNG SỐ CỐ ĐỊNH CHO RUN BENCHMARK SEED 1234:
+#   - Model: AWSnet (Attention U-Net with Auto-Weighted Deep Supervision, 8.73M params)
+#   - Seed bắt buộc: 1234 (Cố định, sinh ngẫu nhiên tái lập hoàn toàn)
+#   - Phần cứng bắt buộc: Duy nhất 01 GPU NVIDIA A100 (Không chạy tác vụ ngầm lúc đo)
+#   - Độ chính xác (Precision): Chạy thuần FP32 (float32), tắt hoàn toàn AMP: --amp none
+#   - DataLoader: Cố định num_workers = 0, pin_memory = True
+#   - Ngân sách: Đúng 300 epochs, không validation xen giữa, batch_size = 16 (124 steps/epoch)
+#   - Hàm mất mát: Giữ nguyên LossPRSnet_dicece / AWSCompositeLoss gốc của AWSnet
+#   - Hỗ trợ Dataset:
+#       + MyoPS++: Profile myopspp_unet2d_roi128_1mm (64 train / 16 test / Đơn vị HD95: mm)
+#       + MyoPS380: Protocol myops380_train304_test76_last_v1 (304 train / 76 test / Đơn vị HD95: voxel)
+#   - File xuất kết quả 7 chỉ số: outputs/runs/awsnet/efficiency_metrics.json
+# ==============================================================================
+
+set -e
+
+echo "=============================================================================="
+echo "🎯 KHỞI TẠO MÔI TRƯỜNG CHẠY BENCHMARK SEED ĐẶC BIỆT 1234 (AWSNET)"
+echo "   Quy tắc: Thuần FP32 (--amp none) | num_workers = 0 | 1x NVIDIA A100 GPU"
+echo "=============================================================================="
+
+# === BƯỚC 1/7: KIỂM TRA PHẦN CỨNG & KÍCH HOẠT GPU A100 ===
+echo ""
+echo "=== [1/7] Kiểm tra Phần cứng GPU NVIDIA A100 ==="
+cd /content
+
+if [ -d "/usr/lib64-nvidia" ]; then
+    if ! grep -q "/usr/lib64-nvidia" /etc/ld.so.conf.d/nvidia.conf 2>/dev/null; then
+        echo "/usr/lib64-nvidia" >> /etc/ld.so.conf.d/nvidia.conf 2>/dev/null || true
+        ldconfig 2>/dev/null || true
+    fi
+    export LD_LIBRARY_PATH=/usr/lib64-nvidia:${LD_LIBRARY_PATH}
+fi
+if ! grep -q "/usr/lib64-nvidia" ~/.bashrc 2>/dev/null; then
+    echo 'export LD_LIBRARY_PATH=/usr/lib64-nvidia:$LD_LIBRARY_PATH' >> ~/.bashrc 2>/dev/null || true
+fi
+
+if ! command -v nvidia-smi &> /dev/null; then
+    echo "❌ LỖI: Không tìm thấy NVIDIA GPU! Hãy kiểm tra lại Runtime > Change runtime type > A100 GPU trên Colab."
+    exit 1
+fi
+
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
+GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -n 1)
+echo "✅ GPU phát hiện: $GPU_NAME ($GPU_MEM)"
+
+if [[ "$GPU_NAME" == *"A100"* ]]; then
+    echo "✅ Xác nhận đúng GPU NVIDIA A100 theo Điều 1 của Quy tắc benchmark!"
+else
+    echo "⚠️ CẢNH BÁO: GPU hiện tại ($GPU_NAME) không phải NVIDIA A100."
+    echo "   Quy tắc đo hiệu suất tính toán yêu cầu duy nhất 01 GPU NVIDIA A100 để đảm bảo tính công bằng đối sánh."
+fi
+
+# Chống phân mảnh bộ nhớ CUDA
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+
+# === BƯỚC 2/7: MOUNT GOOGLE DRIVE LƯU TRỮ AN TOÀN ===
+echo ""
+echo "=== [2/7] Mount Google Drive (Bảo vệ Checkpoint & Metrics JSON) ==="
+python3 -c "
+import os
+if not os.path.exists('/content/drive/MyDrive'):
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive')
+        print('✅ Mount Google Drive thành công!')
+    except Exception as e:
+        print('⚠️ Không thể mount Drive tự động (bỏ qua nếu chạy local/server ngoài):', e)
+" || true
+
+
+# === BƯỚC 3/7: THIẾT LẬP REPOSITORY AWSNET ===
+echo ""
+echo "=== [3/7] Thiết lập Repository AWSnet ==="
+REPO_URL="https://github.com/mintduckk24/AWSnet.git"
+
+if [ -f "./train.py" ] && [ -d "./models" ]; then
+    echo "✅ Đang đứng trực tiếp trong thư mục AWSnet."
+elif [ -d "/content/AWSnet" ]; then
+    echo "✅ Thư mục /content/AWSnet đã tồn tại."
+elif [ -f "/content/AWSnet.zip" ]; then
+    echo "✅ Phát hiện /content/AWSnet.zip. Đang giải nén..."
+    unzip -q -o "/content/AWSnet.zip" -d /content/
+elif [ -f "/content/drive/MyDrive/AWSnet.zip" ]; then
+    echo "✅ Phát hiện AWSnet.zip trên Google Drive. Đang giải nén..."
+    unzip -q -o "/content/drive/MyDrive/AWSnet.zip" -d /content/
+elif [ -d "/content/drive/MyDrive/AWSnet" ]; then
+    echo "✅ Phát hiện thư mục AWSnet trên Drive. Đang sao chép vào /content/AWSnet..."
+    cp -r "/content/drive/MyDrive/AWSnet" /content/AWSnet
+else
+    echo "Đang clone repository từ $REPO_URL..."
+    git clone "$REPO_URL" /content/AWSnet || {
+        echo "❌ Chưa thể clone từ $REPO_URL."
+        echo "👉 Bạn có thể kéo thả file AWSnet.zip vào thư mục /content/ rồi chạy lại script."
+        exit 1
+    }
+fi
+
+cd /content/AWSnet
+AWSNET_DIR="/content/AWSnet"
+
+
+# === BƯỚC 4/7: CÀI ĐẶT DEPENDENCIES & CÔNG CỤ TÍNH FLOPS ===
+echo ""
+echo "=== [4/7] Cài đặt Thư viện Phụ thuộc (Bao gồm ptflops & thop) ==="
+python3 -m pip install --upgrade pip -q
+if [ -f "requirements.txt" ]; then
+    python3 -m pip install -r requirements.txt gdown -q
+else
+    python3 -m pip install torch torchvision numpy scipy h5py nibabel pandas tqdm gdown ptflops thop -q
+fi
+
+
+# === BƯỚC 5/7: THIẾT LẬP ĐƯỜNG DẪN LƯU CHECKPOINTS & OUTPUTS ===
+echo ""
+echo "=== [5/7] Thiết lập Thư mục Checkpoint & Xuất kết quả Benchmark ==="
+if [ -d "/content/drive/MyDrive" ]; then
+    SAVE_DIR="/content/drive/MyDrive/AWSnet/checkpoints"
+    DRIVE_METRICS_DIR="/content/drive/MyDrive/AWSnet/outputs/runs/awsnet"
+    mkdir -p "$SAVE_DIR"
+    mkdir -p "$DRIVE_METRICS_DIR"
+    echo "✅ Checkpoint và Metrics sẽ được lưu trữ an toàn trên Google Drive:"
+    echo "   - Checkpoint: $SAVE_DIR/awsnet_seed1234.pt"
+    echo "   - Metrics JSON: $DRIVE_METRICS_DIR/efficiency_metrics.json"
+else
+    SAVE_DIR="/content/AWSnet/checkpoints"
+    mkdir -p "$SAVE_DIR"
+    echo "⚠️ Chưa mount Drive, lưu tạm tại local: $SAVE_DIR"
+fi
+
+RUNS_DIR="/content/AWSnet/outputs/runs/awsnet"
+mkdir -p "$RUNS_DIR"
+
+
+# === BƯỚC 6/7: TẢI VÀ CHUẨN BỊ DATASET (HỖ TRỢ CẢ MYOPS++ VÀ MYOPS380) ===
+echo ""
+echo "=== [6/7] Tải và Định vị Dataset ==="
+DATASET_NAME="${DATASET_NAME:-myopspp_unet2d_roi128_1mm}"
+
+if [ "$DATASET_NAME" = "myopspp_unet2d_roi128_1mm" ]; then
+    echo "🎯 Lựa chọn Dataset: MyoPS++ (ROI 128x128, Spacing 1.0mm, Đơn vị HD95: mm)"
+    MYOPSPP_DIR="/content/AWSnet/Dataset/MyoPSpp_UNet2D_ROI128_1mm"
+    MYOPSPP_ZIP="/content/AWSnet/Dataset/MyoPSpp_UNet2D_ROI128_1mm.zip"
+    MYOPSPP_ID="1FmHR9_e0AW3snN_qscUsVGn7Vk0y3fLk"
+
+    MYOPSPP_SRC=$(find /content/drive/MyDrive /content/AWSnet/Dataset /content/Dataset /content -name "dataset_manifest.json" -exec dirname {} \; 2>/dev/null | head -n 1 || true)
+    if [ -n "$MYOPSPP_SRC" ] && [ -d "$MYOPSPP_SRC/cases" ]; then
+        LOCAL_DATASET="$MYOPSPP_SRC"
+    elif [ -d "$MYOPSPP_DIR/cases" ]; then
+        LOCAL_DATASET="$MYOPSPP_DIR"
+    elif [ -d "$MYOPSPP_DIR/MyoPSpp_UNet2D_ROI128_1mm/cases" ]; then
+        LOCAL_DATASET="$MYOPSPP_DIR/MyoPSpp_UNet2D_ROI128_1mm"
+    else
+        mkdir -p "$MYOPSPP_DIR"
+        if [ ! -s "$MYOPSPP_ZIP" ]; then
+            echo "⬇️ Đang tải MyoPSpp_UNet2D_ROI128_1mm từ Google Drive..."
+            gdown --id "$MYOPSPP_ID" -O "$MYOPSPP_ZIP" || true
+        fi
+        if [ -s "$MYOPSPP_ZIP" ]; then
+            unzip -q -o "$MYOPSPP_ZIP" -d "$MYOPSPP_DIR/"
+        fi
+        MYOPSPP_SRC=$(find "$MYOPSPP_DIR" -name "dataset_manifest.json" -exec dirname {} \; 2>/dev/null | head -n 1 || true)
+        if [ -n "$MYOPSPP_SRC" ] && [ -d "$MYOPSPP_SRC/cases" ]; then
+            LOCAL_DATASET="$MYOPSPP_SRC"
+        elif [ -d "$MYOPSPP_DIR/cases" ]; then
+            LOCAL_DATASET="$MYOPSPP_DIR"
+        elif [ -d "$MYOPSPP_DIR/MyoPSpp_UNet2D_ROI128_1mm/cases" ]; then
+            LOCAL_DATASET="$MYOPSPP_DIR/MyoPSpp_UNet2D_ROI128_1mm"
+        else
+            LOCAL_DATASET="$MYOPSPP_DIR"
+        fi
+    fi
+
+    SPLIT_DIR="$AWSNET_DIR/dataset/splits/myopspp_unet2d_roi128_1mm"
+    LABEL_ORDER="canonical"
+    DISTANCE_UNIT="mm"
+    echo "✅ Đã xác định Dataset MyoPS++: $LOCAL_DATASET (Split: $SPLIT_DIR, Nhãn: $LABEL_ORDER, HD95: $DISTANCE_UNIT)"
+
+else
+    echo "🎯 Lựa chọn Dataset: MyoPS380 (Chuẩn Legacy, Đơn vị HD95: voxel)"
+    DATASET_FOLDER_ID="13T6892xy-pUwC1BSjGl4sRxoypMu-SIS"
+    DOWNLOAD_DIR="/content/dataset_download"
+    TARGET_DATASET_DIR="/content/AWSnet/MyoPS380_dataset"
+
+    mkdir -p "$DOWNLOAD_DIR"
+    mkdir -p "$TARGET_DATASET_DIR"
+
+    DRIVE_DATASET_DIR="/content/drive/MyDrive/MyoPS380_dataset"
+    if [ -d "$DRIVE_DATASET_DIR/Processed_data/bSSFP" ]; then
+        LOCAL_DATASET="$DRIVE_DATASET_DIR/Processed_data"
+    elif [ -d "/content/drive/MyDrive/Processed_data/bSSFP" ]; then
+        LOCAL_DATASET="/content/drive/MyDrive/Processed_data"
+    else
+        if [ -z "$(ls -A "$DOWNLOAD_DIR" 2>/dev/null)" ] && [ -z "$(ls -A "$TARGET_DATASET_DIR" 2>/dev/null)" ]; then
+            echo "Đang tải dataset MyoPS380 từ Google Drive..."
+            gdown --folder --id "$DATASET_FOLDER_ID" -O "$DOWNLOAD_DIR" --remaining-ok || true
+        fi
+        for zipfile in $(find "$DOWNLOAD_DIR" -maxdepth 2 -name "*.zip" 2>/dev/null); do
+            unzip -q -o "$zipfile" -d "$TARGET_DATASET_DIR/"
+        done
+        FOUND_TRAIN_NPZ=$(find "$TARGET_DATASET_DIR" "$DOWNLOAD_DIR" /content -type d -name "train_npz" 2>/dev/null | grep -i "bSSFP" | head -n 1 || true)
+        if [ -n "$FOUND_TRAIN_NPZ" ]; then
+            LOCAL_DATASET=$(dirname $(dirname "$FOUND_TRAIN_NPZ"))
+        else
+            LOCAL_DATASET="/content/AWSnet/MyoPS380_dataset/Processed_data"
+        fi
+    fi
+
+    SPLIT_DIR="$AWSNET_DIR/dataset/splits/myops380_no_val"
+    LABEL_ORDER="legacy"
+    DISTANCE_UNIT="voxel"
+    echo "✅ Đã xác định Dataset MyoPS380: $LOCAL_DATASET (Split: $SPLIT_DIR, Nhãn: $LABEL_ORDER, HD95: $DISTANCE_UNIT)"
+fi
+
+
+# === BƯỚC 7/7: KIỂM TRA CHUẨN HÓA MÔI TRƯỜNG PYTORCH ===
+echo ""
+echo "=== [7/7] Kiểm tra Thư viện & Cấu hình Seed 1234 ==="
+command -v tmux &> /dev/null || (apt-get update -qq && apt-get install -y tmux)
+python3 -c "
+import torch
+print(f'PyTorch: {torch.__version__} | CUDA Available: {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'Device 0: {torch.cuda.get_device_name(0)}')
+"
+
+echo ""
+echo "=============================================================================="
+echo "🎯 CẤU HÌNH ĐÃ ĐƯỢC XÁC NHẬN CHÍNH XÁC 100% THEO QUY TẮC BENCHMARK:"
+echo "   - Model: AWSnet (8.73M Parameters)"
+echo "   - Seed: 1234 (Cố định, sinh ngẫu nhiên tái lập hoàn toàn)"
+echo "   - Precision: Pure FP32 (--amp none)"
+echo "   - DataLoader: num_workers = 0, pin_memory = True"
+echo "   - Ngân sách: 300 Epochs, batch_size = 16, Zero Validation"
+echo "   - Đơn vị HD95: $DISTANCE_UNIT"
+echo "   - Output: outputs/runs/awsnet/efficiency_metrics.json"
+echo "=============================================================================="
+echo ""
+
+
+# ==============================================================================
+# QUY TRÌNH THỰC THI 3 GIAI ĐOẠN CHO SEED 1234
+# ==============================================================================
+SEED=1234
+CKPT_FILE="$SAVE_DIR/awsnet_seed${SEED}.pt"
+SUMMARY_FILE="$SAVE_DIR/training_summary_seed${SEED}.json"
+METRICS_JSON="outputs/runs/awsnet/efficiency_metrics.json"
+
+echo "🚀 [GIAI ĐOẠN 1/3]: BẮT ĐẦU HUẤN LUYỆN 300 EPOCHS (SEED 1234 - FP32)..."
+python3 train.py \
+    --data_dir "$LOCAL_DATASET" \
+    --split_dir "$SPLIT_DIR" \
+    --save_dir "$SAVE_DIR" \
+    --dataset "$DATASET_NAME" \
+    --label_order "$LABEL_ORDER" \
+    --seed $SEED \
+    --max_epochs 300 \
+    --batch_size 16 \
+    --accum_steps 1 \
+    --base_lr 0.0003333 \
+    --weight_decay 0.0001 \
+    --amp none \
+    --num_workers 0 \
+    --pin_memory \
+    --resume
+
+echo ""
+echo "🚀 [GIAI ĐOẠN 2/3]: ĐO & XUẤT 7 CHỈ SỐ HIỆU SUẤT TÍNH TOÁN & ĐỘ GỌN NHẸ..."
+python3 benchmark_efficiency.py \
+    --checkpoint "$CKPT_FILE" \
+    --summary "$SUMMARY_FILE" \
+    --output "$METRICS_JSON" \
+    --dataset "$DATASET_NAME" \
+    --seed $SEED
+
+# Sao chép và sao lưu tự động file efficiency_metrics.json
+if [ -d "/content/drive/MyDrive/AWSnet" ]; then
+    cp "$METRICS_JSON" "/content/drive/MyDrive/AWSnet/outputs/runs/awsnet/" 2>/dev/null || true
+    cp "$METRICS_JSON" "$SAVE_DIR/" 2>/dev/null || true
+    echo "✅ Đã sao lưu $METRICS_JSON vào Google Drive an toàn!"
+fi
+
+echo ""
+echo "🚀 [GIAI ĐOẠN 3/3]: ĐÁNH GIÁ KIỂM THỬ TRÊN TẬP TEST (HD95 tính chuẩn $DISTANCE_UNIT)..."
+if [ -f "$CKPT_FILE" ]; then
+    python3 evaluate.py \
+        --checkpoint "$CKPT_FILE" \
+        --data_dir "$LOCAL_DATASET" \
+        --split_dir "$SPLIT_DIR" \
+        --dataset "$DATASET_NAME" \
+        --output_dir "/content/AWSnet/test_predictions_seed${SEED}" \
+        --batch_size 8 \
+        --amp none
+
+    # Sao chép kết quả sang Drive
+    if [ -d "$SAVE_DIR" ]; then
+        cp "/content/AWSnet/test_predictions_seed${SEED}/metrics.json" "$SAVE_DIR/metrics_test_seed${SEED}.json" 2>/dev/null || true
+        cp "/content/AWSnet/test_predictions_seed${SEED}/per_case.csv" "$SAVE_DIR/per_case_test_seed${SEED}.csv" 2>/dev/null || true
+    fi
+else
+    echo "⚠️ Không tìm thấy file checkpoint: $CKPT_FILE"
+fi
+
+echo ""
+echo "=============================================================================="
+echo "🎉 HOÀN THÀNH TOÀN DIỆN BENCHMARK SEED ĐẶC BIỆT 1234 CHO AWSNET!"
+echo "   - Model Checkpoint: $CKPT_FILE"
+echo "   - 7 Chỉ số Hiệu năng: $METRICS_JSON"
+echo "   - Thư mục dự đoán: /content/AWSnet/test_predictions_seed${SEED}"
+echo "=============================================================================="

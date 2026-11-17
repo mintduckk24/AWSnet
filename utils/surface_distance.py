@@ -21,9 +21,19 @@ BENCHMARK_PROTOCOL = {
     "pathology_aggregation": "arithmetic mean of scar and exclusive-edema patient means; both required",
 }
 
+ROI_PROFILES = {
+    "myopspp_roi128_76": {"export_id": "roi128mm_76cases", "crop_mm": 128, "spacing_xy": 1.0,
+                         "excluded": ("Case2013", "Case2017", "Case2018", "Case2031")},
+    "myopspp_roi128_80": {"export_id": "roi128mm_80cases", "crop_mm": 128, "spacing_xy": 1.0,
+                         "excluded": ()},
+    "myopspp_roi160_80": {"export_id": "roi160mm_to128_80cases", "crop_mm": 160, "spacing_xy": 1.25,
+                         "excluded": ()},
+    "myopspp_unet2d_roi128_1mm": {"export_id": "MyoPSpp_UNet2D_ROI128_1mm", "crop_mm": 128, "spacing_xy": 1.0,
+                                  "excluded": ()},
+}
+
 
 def protocol_for_dataset(dataset_id="myops380"):
-    from training.dataset.benchmark_profiles import ROI_PROFILES
     if dataset_id == "myops380":
         return BENCHMARK_PROTOCOL
     if dataset_id in ROI_PROFILES:
@@ -31,14 +41,21 @@ def protocol_for_dataset(dataset_id="myops380"):
         return dict(BENCHMARK_PROTOCOL,
                 id=f"{dataset_id}_roi_mm_v2", distance_unit="mm",
                 voxelspacing="preprocessed ROI NIfTI spacing in mm, orthogonal grid",
-                evaluation_grid="preprocessed_roi", localization="oracle_gt_bbox",
+                evaluation_grid="preprocessed_roi", localization="unet2d_roi",
                 crop_mm=profile["crop_mm"], model_hw=[128, 128],
                 spacing_xy_mm=profile["spacing_xy"])
-    if dataset_id != "myopspp_bc80":
-        raise ValueError(f"Unknown metric dataset profile: {dataset_id}")
-    return dict(BENCHMARK_PROTOCOL,
-            id="myopspp_bc80_mm_v2", distance_unit="mm",
-            voxelspacing="native NIfTI spacing in mm, orthogonal grid")
+    if dataset_id == "myopspp_bc80":
+        return dict(BENCHMARK_PROTOCOL,
+                id="myopspp_bc80_mm_v2", distance_unit="mm",
+                voxelspacing="native NIfTI spacing in mm, orthogonal grid")
+    if str(dataset_id).lower().startswith("myopspp"):
+        return dict(BENCHMARK_PROTOCOL,
+                id=f"{dataset_id}_mm_v2", distance_unit="mm",
+                voxelspacing="preprocessed ROI NIfTI spacing in mm, orthogonal grid",
+                evaluation_grid="preprocessed_roi", localization="roi",
+                crop_mm=128, model_hw=[128, 128],
+                spacing_xy_mm=1.0)
+    raise ValueError(f"Unknown metric dataset profile: {dataset_id}")
 
 
 def benchmark_protocol_matches(saved_protocol, dataset_id="myops380", *, allow_legacy_selection=True):
